@@ -15,6 +15,8 @@ export interface StudioDocument {
   hostName: string;
   rating: number;
   reviewCount: number;
+  bookingLockToken?: string;
+  bookingLockExpiresAt?: Date;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -33,6 +35,8 @@ const studioSchema = new Schema<StudioDocument>({
   hostName: { type: String, default: "StudioSpace host", trim: true },
   rating: { type: Number, default: 0, min: 0, max: 5 },
   reviewCount: { type: Number, default: 0, min: 0 },
+  bookingLockToken: { type: String },
+  bookingLockExpiresAt: { type: Date },
 }, { timestamps: true, versionKey: false });
 
 studioSchema.index({ title: "text", description: "text", location: "text" });
@@ -61,7 +65,7 @@ const bookingSchema = new Schema<BookingDocument>({
   startTime: { type: String, required: true },
   endTime: { type: String, required: true },
   totalPrice: { type: Number, required: true, min: 0 },
-  status: { type: String, enum: ["pending", "confirmed", "completed", "cancelled"], default: "pending" },
+  status: { type: String, enum: ["pending", "confirmed", "completed", "cancelled", "rejected"], default: "pending" },
 }, { timestamps: true, versionKey: false });
 
 bookingSchema.index({ studioId: 1, bookingDate: 1, status: 1, startTime: 1, endTime: 1 });

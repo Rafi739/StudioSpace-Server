@@ -9,7 +9,8 @@ export type BookingStatus =
   | "pending"
   | "confirmed"
   | "completed"
-  | "cancelled";
+  | "cancelled"
+  | "rejected";
 
 export interface SessionUser {
   id: string;

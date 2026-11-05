@@ -12,7 +12,7 @@ import { z } from "zod";
 import { auth } from "./auth.js";
 import { connectDatabase } from "./db.js";
 import { BookingModel, NewsletterModel, ReviewModel, StudioModel } from "./models.js";
-import { bookingInputSchema, newsletterSchema, profileUpdateSchema, reviewInputSchema, studioInputSchema, studioUpdateSchema } from "./validation.js";
+import { bookingDurationSchema, bookingInputSchema, bookingStatusUpdateSchema, newsletterSchema, profileUpdateSchema, reviewInputSchema, studioInputSchema, studioUpdateSchema } from "./validation.js";
 import type { BookingStatus, SessionUser } from "./types.js";
 
 const app = express();
@@ -42,6 +42,7 @@ const imageUpload = multer({
     callback(null, true);
   },
 });
+const bookingLockDurationMs = 120_000;
 
 app.use(cors({
   origin: process.env.CLIENT_URL ?? "http://localhost:3000",
@@ -73,6 +74,42 @@ async function authenticate(req: Request, res: Response, next: NextFunction): Pr
 function currentUser(req: Request): SessionUser {
   if (!req.user) throw new Error("Authenticated user was not attached to the request.");
   return req.user;
+}
+
+async function acquireBookingLock(studioId: mongoose.Types.ObjectId): Promise<string | null> {
+  const token = randomUUID();
+  const lock = await StudioModel.findOneAndUpdate(
+    {
+      _id: studioId,
+      $or: [
+        { bookingLockExpiresAt: { $exists: false } },
+        { bookingLockExpiresAt: null },
+        { bookingLockExpiresAt: { $lt: new Date() } },
+      ],
+    },
+    {
+      $set: {
+        bookingLockToken: token,
+        bookingLockExpiresAt: new Date(Date.now() + bookingLockDurationMs),
+      },
+    },
+    { new: true },
+  );
+  return lock ? token : null;
+}
+
+async function releaseBookingLock(studioId: mongoose.Types.ObjectId, token: string): Promise<void> {
+  try {
+    const released = await StudioModel.updateOne(
+      { _id: studioId, bookingLockToken: token },
+      { $unset: { bookingLockToken: 1, bookingLockExpiresAt: 1 } },
+    );
+    if (released.matchedCount !== 1) {
+      console.error("Booking lock expired before it could be released.", studioId.toString());
+    }
+  } catch (releaseError) {
+    console.error("Could not release booking lock; it will expire automatically.", releaseError);
+  }
 }
 
 function serializeStudio(studio: InstanceType<typeof StudioModel>) {
@@ -165,7 +202,7 @@ app.post("/api/uploads/images", authenticate, (req, res, next) => {
       }
       return;
     }
-    const origin = process.env.BETTER_AUTH_URL ?? `http://localhost:${port}`;
+    const origin = new URL(process.env.BETTER_AUTH_URL ?? `http://localhost:${port}`).origin;
     res.status(201).json({ url: `${origin}/uploads/${encodeURIComponent(req.file.filename)}` });
   });
 });
@@ -207,6 +244,41 @@ app.get("/api/studios/:id", async (req, res, next) => {
     const studio = await StudioModel.findById(req.params.id);
     if (!studio) { res.status(404).json({ error: "Studio not found." }); return; }
     res.json({ studio: serializeStudio(studio) });
+  } catch (error) { next(error); }
+});
+
+app.get("/api/studios/:id/availability", async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) { res.status(400).json({ error: "Invalid studio ID." }); return; }
+    const dateValue = req.query.date;
+    const durationResult = bookingDurationSchema.safeParse(req.query.duration);
+    if (typeof dateValue !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(dateValue) || !durationResult.success) {
+      res.status(400).json({ error: "Choose a valid date and booking duration." }); return;
+    }
+    const date = new Date(`${dateValue}T00:00:00.000Z`);
+    if (Number.isNaN(date.valueOf()) || date.toISOString().slice(0, 10) !== dateValue) {
+      res.status(400).json({ error: "Choose a valid booking date." }); return;
+    }
+    if (dateValue < new Date().toISOString().slice(0, 10)) {
+      res.status(400).json({ error: "Booking dates must be today or later." }); return;
+    }
+    const studioExists = await StudioModel.exists({ _id: req.params.id });
+    if (!studioExists) { res.status(404).json({ error: "Studio not found." }); return; }
+    const duration = durationResult.data;
+    const bookings = await BookingModel.find({
+      studioId: req.params.id,
+      bookingDate: dateValue,
+      status: { $in: ["pending", "confirmed"] },
+    }).select({ startTime: 1, endTime: 1 });
+    const startTimes: string[] = [];
+    for (let hour = 9; hour + duration <= 22; hour += 1) {
+      const startTime = `${String(hour).padStart(2, "0")}:00`;
+      const endTime = `${String(hour + duration).padStart(2, "0")}:00`;
+      if (!bookings.some((booking) => booking.startTime < endTime && booking.endTime > startTime)) {
+        startTimes.push(startTime);
+      }
+    }
+    res.json({ startTimes });
   } catch (error) { next(error); }
 });
 
@@ -313,9 +385,33 @@ app.patch("/api/studios/:id", authenticate, async (req, res, next) => {
 app.delete("/api/studios/:id", authenticate, async (req, res, next) => {
   try {
     if (!mongoose.isValidObjectId(req.params.id)) { res.status(400).json({ error: "Invalid studio ID." }); return; }
-    const studio = await StudioModel.findOneAndDelete({ _id: req.params.id, hostId: currentUser(req).id });
-    if (!studio) { res.status(404).json({ error: "Studio not found or you do not own it." }); return; }
-    res.json({ success: true });
+    const userId = currentUser(req).id;
+    const ownedStudio = await StudioModel.findOne({ _id: req.params.id, hostId: userId }).select({ _id: 1 });
+    if (!ownedStudio) { res.status(404).json({ error: "Studio not found or you do not own it." }); return; }
+    const lockToken = await acquireBookingLock(ownedStudio._id);
+    if (!lockToken) { res.status(409).json({ error: "A booking is being processed for this studio. Please try again." }); return; }
+
+    let deleted = false;
+    try {
+      const activeBooking = await BookingModel.exists({
+        studioId: ownedStudio._id,
+        status: { $in: ["pending", "confirmed"] },
+      });
+      if (activeBooking) {
+        res.status(409).json({ error: "This studio has active bookings and cannot be deleted yet." });
+        return;
+      }
+      const studio = await StudioModel.findOneAndDelete({
+        _id: ownedStudio._id,
+        hostId: userId,
+        bookingLockToken: lockToken,
+      });
+      if (!studio) { res.status(409).json({ error: "The studio changed while deletion was in progress. Please try again." }); return; }
+      deleted = true;
+      res.json({ success: true });
+    } finally {
+      if (!deleted) await releaseBookingLock(ownedStudio._id, lockToken);
+    }
   } catch (error) { next(error); }
 });
 
@@ -333,11 +429,19 @@ app.post("/api/bookings", authenticate, async (req, res, next) => {
     const startMinutes = Number(startTime.slice(0, 2)) * 60 + Number(startTime.slice(3));
     const endMinutes = Number(endTime.slice(0, 2)) * 60 + Number(endTime.slice(3));
     if (endMinutes <= startMinutes) { res.status(400).json({ error: "End time must be after start time." }); return; }
+    const durationMinutes = endMinutes - startMinutes;
+    if (startMinutes < 9 * 60 || endMinutes > 22 * 60 || startMinutes % 60 !== 0 ||
+      durationMinutes % 60 !== 0 || durationMinutes < 60 || durationMinutes > 12 * 60) {
+      res.status(400).json({ error: "Choose an available whole-hour slot between 9:00 and 22:00 (1–12 hours)." }); return;
+    }
 
     const studio = await StudioModel.findById(studioId);
     if (!studio) { res.status(404).json({ error: "Studio not found." }); return; }
     const user = currentUser(req);
     if (studio.hostId === user.id) { res.status(400).json({ error: "You cannot book your own studio." }); return; }
+    const lockToken = await acquireBookingLock(studio._id);
+    if (!lockToken) { res.status(409).json({ error: "Another booking is being processed for this studio. Please try again." }); return; }
+    try {
     const existing = await BookingModel.findOne({
       studioId,
       bookingDate,
@@ -360,6 +464,9 @@ app.post("/api/bookings", authenticate, async (req, res, next) => {
       status: "pending",
     });
     res.status(201).json({ booking: serializeBooking(booking) });
+    } finally {
+      await releaseBookingLock(studio._id, lockToken);
+    }
   } catch (error) { next(error); }
 });
 
@@ -393,13 +500,18 @@ app.get("/api/bookings/:id", authenticate, async (req, res, next) => {
 app.patch("/api/bookings/:id/cancel", authenticate, async (req, res, next) => {
   try {
     if (!mongoose.isValidObjectId(req.params.id)) { res.status(400).json({ error: "Invalid booking ID." }); return; }
-    const booking = await BookingModel.findOne({ _id: req.params.id, userId: currentUser(req).id });
-    if (!booking) { res.status(404).json({ error: "Booking not found." }); return; }
-    if (booking.status !== "pending" && booking.status !== "confirmed") {
+    const userId = currentUser(req).id;
+    const booking = await BookingModel.findOneAndUpdate(
+      { _id: req.params.id, userId, status: { $in: ["pending", "confirmed"] } },
+      { $set: { status: "cancelled" } },
+      { new: true, runValidators: true },
+    );
+    if (!booking && !await BookingModel.exists({ _id: req.params.id, userId })) {
+      res.status(404).json({ error: "Booking not found." }); return;
+    }
+    if (!booking) {
       res.status(409).json({ error: "Only pending or confirmed bookings can be cancelled." }); return;
     }
-    booking.status = "cancelled";
-    await booking.save();
     res.json({ booking: serializeBooking(booking) });
   } catch (error) { next(error); }
 });
@@ -407,36 +519,44 @@ app.patch("/api/bookings/:id/cancel", authenticate, async (req, res, next) => {
 app.patch("/api/bookings/:id/status", authenticate, async (req, res, next) => {
   try {
     if (!mongoose.isValidObjectId(req.params.id)) { res.status(400).json({ error: "Invalid booking ID." }); return; }
-    const body = req.body as { status?: unknown };
-    const allowed: BookingStatus[] = ["confirmed", "completed", "cancelled"];
-    if (typeof body.status !== "string" || !allowed.includes(body.status as BookingStatus)) {
-      res.status(400).json({ error: "Status must be confirmed, completed, or cancelled." }); return;
-    }
-    const booking = await BookingModel.findOne({ _id: req.params.id, hostId: currentUser(req).id });
-    if (!booking) { res.status(404).json({ error: "Booking not found or you do not host it." }); return; }
-    if (booking.status === "cancelled" || booking.status === "completed") {
+    const result = bookingStatusUpdateSchema.safeParse(req.body);
+    if (!result.success) { sendValidationError(res, result.error.issues.map((issue) => issue.message)); return; }
+    const booking = await BookingModel.findById(req.params.id);
+    if (!booking) { res.status(404).json({ error: "Booking not found." }); return; }
+    const studio = await StudioModel.exists({ _id: booking.studioId, hostId: currentUser(req).id });
+    if (!studio) { res.status(403).json({ error: "Only the studio owner can manage this booking." }); return; }
+    const previousStatus: BookingStatus = result.data.status === "confirmed" || result.data.status === "rejected"
+      ? "pending"
+      : "confirmed";
+    const updatedBooking = await BookingModel.findOneAndUpdate(
+      { _id: booking._id, studioId: booking.studioId, status: previousStatus },
+      { $set: { status: result.data.status } },
+      { new: true, runValidators: true },
+    );
+    if (!updatedBooking) {
       res.status(409).json({ error: "This booking can no longer be changed." }); return;
     }
-    booking.status = body.status as BookingStatus;
-    await booking.save();
-    res.json({ booking: serializeBooking(booking) });
+    res.json({ booking: serializeBooking(updatedBooking) });
   } catch (error) { next(error); }
 });
 
 app.get("/api/dashboard", authenticate, async (req, res, next) => {
   try {
     const userId = currentUser(req).id;
-    const [studioCount, bookings, earnings] = await Promise.all([
-      StudioModel.countDocuments({ hostId: userId }),
-      BookingModel.find({ hostId: userId }).sort({ createdAt: -1 }).limit(5),
+    const studios = await StudioModel.find({ hostId: userId }).select({ _id: 1 });
+    const studioIds = studios.map((studio) => studio._id);
+    const bookingFilter = { studioId: { $in: studioIds } };
+    const [bookings, earnings, bookingCount] = await Promise.all([
+      BookingModel.find(bookingFilter).sort({ createdAt: -1 }).limit(5),
       BookingModel.aggregate<{ total: number }>([
-        { $match: { hostId: userId, status: { $in: ["confirmed", "completed"] } } },
+        { $match: { ...bookingFilter, status: { $in: ["confirmed", "completed"] } } },
         { $group: { _id: null, total: { $sum: "$totalPrice" } } },
       ]),
+      BookingModel.countDocuments(bookingFilter),
     ]);
     res.json({
-      studioCount,
-      bookingCount: await BookingModel.countDocuments({ hostId: userId }),
+      studioCount: studios.length,
+      bookingCount,
       earnings: earnings[0]?.total ?? 0,
       recentBookings: bookings.map(serializeBooking),
     });
@@ -449,7 +569,10 @@ app.patch("/api/users/me", authenticate, async (req, res, next) => {
     if (!result.success) { sendValidationError(res, result.error.issues.map((issue) => issue.message)); return; }
     const updated = await auth.api.updateUser({
       headers: fromNodeHeaders(req.headers),
-      body: { name: result.data.name, ...(result.data.image ? { image: result.data.image } : {}) },
+      body: {
+        name: result.data.name,
+        ...(result.data.image !== undefined ? { image: result.data.image } : {}),
+      },
     });
     if (!updated.status) { res.status(404).json({ error: "Account could not be updated." }); return; }
     const refreshedSession = await auth.api.getSession({ headers: fromNodeHeaders(req.headers) });

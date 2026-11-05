@@ -4,7 +4,23 @@ const categorySchema = z.enum([
   "Photo Studio", "Podcast Room", "Sound Stage", "Music Studio", "Art Workshop",
 ]);
 
-const imageSchema = z.string().url().refine((value) => value.startsWith("https://"), "Images must use HTTPS.");
+const localUploadPath = /^\/uploads\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(?:jpg|png|webp)$/i;
+
+function isAllowedImageUrl(value: string): boolean {
+  if (!URL.canParse(value)) return false;
+  const url = new URL(value);
+  if (url.protocol === "https:") return true;
+  if (process.env.NODE_ENV === "production" || url.protocol !== "http:") return false;
+
+  const localHost = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+  const backendOrigin = process.env.BETTER_AUTH_URL ?? `http://localhost:${process.env.PORT ?? "4000"}`;
+  if (!URL.canParse(backendOrigin)) return false;
+  const backendUrl = new URL(backendOrigin);
+  return localHost && url.origin === backendUrl.origin && localUploadPath.test(url.pathname) &&
+    !url.search && !url.hash && !url.username && !url.password;
+}
+
+const imageSchema = z.string().url().refine(isAllowedImageUrl, "Images must use HTTPS or a trusted local upload URL.");
 
 export const studioInputSchema = z.object({
   title: z.string().trim().min(3).max(100),
@@ -25,6 +41,12 @@ export const bookingInputSchema = z.object({
   bookingDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD."),
   startTime: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/, "Use 24-hour HH:MM."),
   endTime: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/, "Use 24-hour HH:MM."),
+}).strict();
+
+export const bookingDurationSchema = z.coerce.number().int().min(1).max(12);
+
+export const bookingStatusUpdateSchema = z.object({
+  status: z.enum(["confirmed", "rejected", "completed", "cancelled"]),
 }).strict();
 
 export const reviewInputSchema = z.object({
